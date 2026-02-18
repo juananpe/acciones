@@ -1,0 +1,118 @@
+name: LinkUp search & summarize
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Search topic to query LinkUp'
+        required: true
+        default: 'OpenAI'
+      includeImages:
+        description: 'Include images in results (true/false)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+  actions: read
+  models: read
+
+jobs:
+  search-and-summarize:
+    name: Search LinkUp and summarize with GPT-4.1
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve LINKUP_API_KEY (secrets preferred, fallback to .env)
+        id: read_key
+        run: |
+          # Prefer repository secret; fall back to .env for demo/testing only
+          if [ -n "${{ secrets.LINKUP_API_KEY }}" ]; then
+            echo "Using LINKUP_API_KEY from repository secrets"
+            echo "LINKUP_KEY=${{ secrets.LINKUP_API_KEY }}" >> $GITHUB_ENV
+          else
+            if [ -f .env ] && grep -q '^LINKUP_API_KEY=' .env; then
+              echo "Using LINKUP_API_KEY from repo .env (consider moving to repository secrets)"
+              # extract value after =
+              grep '^LINKUP_API_KEY=' .env | sed 's/^LINKUP_API_KEY=//' >> $GITHUB_ENV
+              echo "LINKUP_KEY=$(tail -n1 $GITHUB_ENV | cut -d'=' -f2-)" >> /dev/null || true
+            else
+              echo "ERROR: LINKUP_API_KEY not set in secrets or .env" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Call LinkUp search API
+        id: search_linkup
+        env:
+          LINKUP_API_KEY: ${{ env.LINKUP_KEY }}
+          TOPIC: ${{ github.event.inputs.topic }}
+          INCLUDE_IMAGES: ${{ github.event.inputs.includeImages }}
+        run: |
+          set -euo pipefail
+          echo "Searching LinkUp for topic: $TOPIC"
+
+          # Call LinkUp and save full response
+          curl -sS --request POST \
+            --url "https://api.linkup.so/v1/search" \
+            --header "Authorization: Bearer $LINKUP_API_KEY" \
+            --header "Content-Type: application/json" \
+            --data "{\"q\":\"${TOPIC//\"/\\\"}\",\"depth\":\"standard\",\"outputType\":\"searchResults\",\"includeImages\":\"${INCLUDE_IMAGES}\"}" \
+            > linkup-results.json
+
+          # Produce compact JSON (results array) for the LLM prompt
+          if command -v jq >/dev/null 2>&1; then
+            jq -c '.results' linkup-results.json > linkup-results-compact.json || echo '[]' > linkup-results-compact.json
+          else
+            # minimal fallback: try to extract "results" key
+            python -c "import json,sys;print(json.load(open('linkup-results.json')).get('results', []))" > linkup-results-compact.json || echo '[]' > linkup-results-compact.json
+          fi
+
+          # Expose compact results as step output
+          echo "linkup_results<<EOF" >> $GITHUB_OUTPUT
+          cat linkup-results-compact.json >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Summarize results with AI (gpt-4.1)
+        id: ai_summary
+        uses: actions/ai-inference@a380166897b5408b8fb7dddd148142794cb5624a # v2.0.6
+        with:
+          model: openai/gpt-4.1
+          system-prompt: |
+            You are an assistant that summarizes search results. Produce a concise, factual Markdown summary that includes:
+            - 2–3 sentence high-level summary
+            - Top 5 findings (1-line bullets)
+            - Up to 5 relevant links (name + URL)
+            - 1–2 suggested next actions
+            Keep the output <= 300 words and do NOT invent facts.
+          prompt: |
+            Topic: ${{ github.event.inputs.topic }}
+
+            Here are the LinkUp search results (JSON array). Summarize the most important facts, list the top findings and provide relevant links.
+
+            Results JSON:
+            ${{ steps.search_linkup.outputs.linkup_results }}
+
+            Return the summary in Markdown.
+          max-tokens: 400
+
+      - name: Show & save AI summary
+        run: |
+          echo "---- AI SUMMARY ----"
+          echo "${{ steps.ai_summary.outputs.response }}"
+          echo "--------------------"
+          printf "%s\n" "${{ steps.ai_summary.outputs.response }}" > linkup-summary.md
+
+      - name: Upload raw results + summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: linkup-search-output
+          path: |
+            linkup-results.json
+            linkup-summary.md
+
+    outputs:
+      summary: ${{ steps.ai_summary.outputs.response }}
